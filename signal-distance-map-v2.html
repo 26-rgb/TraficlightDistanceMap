@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>信号距離マップ</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
+<style>
+html,body{height:100%;margin:0}
+body{font:13px/1.5 -apple-system,"Hiragino Sans","Yu Gothic UI","Noto Sans JP",sans-serif;color:#1f2328}
+#map{position:absolute;inset:0}
+#panel,#legend{position:absolute;z-index:1000;background:rgba(255,255,255,.95);border-radius:10px;box-shadow:0 2px 12px rgba(0,0,0,.25);padding:12px 14px}
+#panel{top:12px;left:60px;width:270px;max-width:calc(100% - 80px)}
+#legend{left:12px;bottom:24px;width:260px;display:none}
+h1{font-size:15px;margin:0 0 4px}
+.s{color:#57606a;font-size:12px;margin:0 0 8px}
+.row{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:6px 0}
+.row input[type=range]{flex:1;min-width:0}
+select{font:inherit;padding:2px 4px}
+button{width:100%;padding:7px;border:0;border-radius:6px;background:#1f2328;color:#fff;font:inherit;cursor:pointer}
+button:disabled{opacity:.4;cursor:default}
+.err{color:#c62828}
+#bar{height:10px;border-radius:5px;margin:6px 0 2px}
+#lab{display:flex;justify-content:space-between;font-size:12px}
+.pin div{width:18px;height:18px;border-radius:50%;background:#1565c0;border:3px solid #fff;box-shadow:0 0 0 2px #1565c0,0 2px 6px rgba(0,0,0,.4)}
+details{margin-top:6px}
+</style>
+</head>
+<body>
+<div id="map"></div>
+
+<div id="panel">
+  <h1>信号距離マップ</h1>
+  <p class="s">地図をクリックしてピンを立てると、周囲約10km²の「信号距離」を色で表示します。赤●は信号機です。</p>
+  <button id="clr" disabled>ピンを消す</button>
+  <div class="row"><span>信号1つの重み</span><input id="lam" type="range" min="0" max="150" step="5" value="50"><b id="lamv">50 m</b></div>
+  <div class="row"><span>表示</span>
+    <select id="mode"><option value="D">信号距離 (m)</option><option value="C">通過する信号数</option><option value="R">伸び率（信号距離÷道のり）</option></select></div>
+  <div class="row"><span>格子サイズ</span>
+    <select id="cs"><option value="25">25 m</option><option value="50" selected>50 m</option><option value="100">100 m</option></select></div>
+  <div id="st" class="s">地図をクリックするとピンを立てます</div>
+  <div id="sn" class="s"></div>
+  <details><summary class="s">計算モデル</summary>
+    <p class="s">信号距離 = 道のり + λ×通過する信号数。歩行者が使える道路網を最短経路探索（Dijkstra法）し、信号ノードを通るたびに λ を加算します。信号ノードが道路網に直結していない場合（横断歩道が別ウェイとして分離マッピングされている等）も、25m以内の最寄り区間に自動的に紐づけて計上します。</p></details>
+</div>
+
+<div id="legend">
+  <b id="lt" class="s"></b>
+  <div id="bar"></div>
+  <div id="lab"><span id="lo"></span><span id="hi"></span></div>
+  <div class="s" style="margin-top:8px">線：道のり250mごとの等距離線（線の色は、その道のりを信号距離だとした場合の色）。塗り色と線の色がずれているほど、信号による「伸び」が大きいことを示します。</div>
+  <div id="ro" class="s" style="margin:6px 0 0">地図上にカーソルを置くと値を表示</div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const HALF = 1600;                       // 一辺3.2km ≒ 10km²
+const OVP = ['https://overpass-api.de/api/interpreter', 'https://overpass.kumi.systems/api/interpreter'];
+const ST = [[253,231,37],[94,201,98],[33,145,140],[59,82,139],[68,1,84]];   // 近い→遠い
+const st = (t, e) => { $('st').textContent = t; $('st').className = 's' + (e ? ' err' : ''); };
+
+async function ov(q) {
+  for (const u of OVP) {
+    try {
+      const r = await fetch(u, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'data=' + encodeURIComponent(q) });
+      if (r.ok) { const d = await r.json(); if (d.elements) return d; }
+    } catch (e) {}
+  }
+  throw new Error('Overpass API から取得できませんでした。時間をおいて再度お試しください。');
+}
+
+/* ---------- 地図 ---------- */
+const gsi = k => L.tileLayer(`https://cyberjapandata.gsi.go.jp/xyz/${k}/{z}/{x}/{y}.png`, { maxNativeZoom: 18, maxZoom: 19, attribution: `<a href="https://maps.gsi.go.jp/development/ichiran.html">国土地理院</a>` });
+const std = gsi('std'), pale = gsi('pale');
+const osm = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxNativeZoom: 19, maxZoom: 19, attribution: '© OpenStreetMap contributors' });
+const map = L.map('map', { layers: [std], preferCanvas: true, minZoom: 5, maxZoom: 19, maxBounds: [[20, 122], [46, 154]], maxBoundsViscosity: 1 }).setView([35.6997, 139.7645], 15);
+L.control.layers({ '国土地理院 標準': std, '国土地理院 淡色': pale, 'OpenStreetMap': osm }).addTo(map);
+map.createPane('heat').style.zIndex = 350;
+map.createPane('sig').style.zIndex = 450;
+L.DomEvent.disableClickPropagation($('panel'));
+L.DomEvent.disableClickPropagation($('legend'));
+$('bar').style.background = `linear-gradient(90deg,${ST.map(c => `rgb(${c})`)})`;
+
+/* ---------- 信号機（常時表示） ---------- */
+const sigLayer = L.layerGroup().addTo(map), seen = new Set(), done = [];
+let busy = false, timer;
+const bb = b => `${b.getSouth()},${b.getWest()},${b.getNorth()},${b.getEast()}`;
+function addSig(id, lat, lon) {
+  if (seen.has(id)) return;
+  seen.add(id);
+  L.circleMarker([lat, lon], { pane: 'sig', radius: 4, weight: 1, color: '#fff', fillColor: '#e53935', fillOpacity: 1, interactive: false }).addTo(sigLayer);
+}
+async function loadSig() {
+  if (busy) return;
+  if (map.getZoom() < 13) { $('sn').textContent = 'ズーム13以上で信号機を取得・表示します'; return; }
+  const b = map.getBounds();
+  if (done.some(d => d.contains(b))) { $('sn').textContent = `信号機 ${seen.size} 件を表示中`; return; }
+  busy = true;
+  const p = b.pad(.25);
+  try {
+    $('sn').textContent = '信号機を取得中…';
+    const d = await ov(`[out:json][timeout:60];(node["highway"="traffic_signals"](${bb(p)});node["crossing"="traffic_signals"](${bb(p)});node["traffic_signals"](${bb(p)}););out;`);
+    d.elements.forEach(e => addSig(e.id, e.lat, e.lon));
+    done.push(p);
+    $('sn').textContent = `信号機 ${seen.size} 件を表示中`;
+    busy = false; timer = setTimeout(loadSig, 100);
+  } catch (e) { busy = false; $('sn').textContent = '信号機の取得に失敗しました（地図を動かすと再試行）'; }
+}
+map.on('moveend', () => { clearTimeout(timer); timer = setTimeout(loadSig, 400); });
+loadSig();
+
+/* ---------- ピンと計算 ---------- */
+let pin = null, rect = null, img = null, G = null, grid = null, token = 0;
+const pinIcon = L.divIcon({ className: 'pin', html: '<div></div>', iconSize: [24, 24], iconAnchor: [12, 12] });
+
+map.on('click', e => {
+  const first = !pin;
+  if (first) { pin = L.marker(e.latlng, { icon: pinIcon, draggable: true }).addTo(map); pin.on('dragend', () => run(false)); }
+  else pin.setLatLng(e.latlng);
+  $('clr').disabled = false;
+  run(first);
+});
+
+$('clr').onclick = () => {
+  token++;
+  [pin, rect].forEach(o => o && map.removeLayer(o));
+  pin = rect = null; clearOverlay();
+  $('clr').disabled = true;
+  st('地図をクリックするとピンを立てます');
+};
+
+function clearOverlay() {
+  if (img) map.removeLayer(img);
+  img = G = grid = null;
+  $('legend').style.display = 'none';
+}
+
+async function run(fit) {
+  const my = ++token, c = pin.getLatLng();
+  clearOverlay();
+  const kx = 111320 * Math.cos(c.lat * Math.PI / 180), ky = 111320;
+  const bnds = L.latLngBounds([c.lat - HALF / ky, c.lng - HALF / kx], [c.lat + HALF / ky, c.lng + HALF / kx]);
+  if (rect) rect.setBounds(bnds);
+  else rect = L.rectangle(bnds, { color: '#1565c0', weight: 1.5, dashArray: '6 4', fill: false, interactive: false }).addTo(map);
+  if (fit) map.fitBounds(bnds.pad(.05));
+  st('道路データを取得中…（数秒〜数十秒）');
+  try {
+    const q = `[out:json][timeout:90][maxsize:300000000];way["highway"]["highway"!~"^(motorway|motorway_link|construction|proposed|raceway|bus_guideway|busway)$"]["foot"!="no"]["access"!~"^(private|no)$"](${bb(bnds)});(._;>;);out body qt;`;
+    const d = await ov(q);
+    if (my !== token) return;
+    st('経路を計算中…');
+    await new Promise(r => setTimeout(r, 30));
+    G = build(d, c, kx, ky);
+    G.sl.forEach(s => addSig(s.id, s.lat, s.lon));
+    paint();
+  } catch (e) { if (my === token) st('エラー: ' + e.message, true); }
+}
+
+/* 信号タグの判定（表記ゆれ・別ウェイの横断歩道なども広く拾う） */
+function isSignal(tags) {
+  if (!tags) return false;
+  const h = (tags.highway || '').toLowerCase(), c = (tags.crossing || '').toLowerCase();
+  if (h === 'traffic_signals' || c === 'traffic_signals') return true;
+  return Object.keys(tags).some(k => k.toLowerCase().startsWith('traffic_signals'));
+}
+function pointSegDist(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay, len2 = dx * dx + dy * dy;
+  let t = len2 ? ((px - ax) * dx + (py - ay) * dy) / len2 : 0;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+}
+
+function build(d, c, kx, ky) {
+  const id2i = new Map(), X = [], Y = [], sig = [], sl = [];
+  for (const e of d.elements) if (e.type === 'node') {
+    id2i.set(e.id, X.length); X.push((e.lon - c.lng) * kx); Y.push((e.lat - c.lat) * ky);
+    const s = isSignal(e.tags) ? 1 : 0;
+    sig.push(s); if (s) sl.push({ id: e.id, lat: e.lat, lon: e.lon });
+  }
+  const n = X.length;
+
+  /* 道路ウェイを重複のないエッジ集合にする */
+  const edges = [], seenE = new Set();
+  for (const e of d.elements) if (e.type === 'way') {
+    const nd = e.nodes;
+    for (let k = 1; k < nd.length; k++) {
+      const a = id2i.get(nd[k - 1]), b = id2i.get(nd[k]);
+      if (a === undefined || b === undefined || a === b) continue;
+      const key = a < b ? a + '_' + b : b + '_' + a;
+      if (seenE.has(key)) continue; seenE.add(key);
+      edges.push({ a, b, l: Math.hypot(X[a] - X[b], Y[a] - Y[b]) });
+    }
+  }
+  const deg = new Int32Array(n);
+  edges.forEach(e => { deg[e.a]++; deg[e.b]++; });
+
+  /* 空間ハッシュ（最寄り点探索・信号スナップ共用） */
+  const B = 60, H = new Map();
+  for (let i = 0; i < n; i++) {
+    if (Math.abs(X[i]) > HALF + 300 || Math.abs(Y[i]) > HALF + 300) continue;
+    const k = Math.floor(X[i] / B) * 4096 + Math.floor(Y[i] / B);
+    if (!H.has(k)) H.set(k, []);
+    H.get(k).push(i);
+  }
+  const edgesByNode = new Map();
+  edges.forEach((e, ix) => {
+    [e.a, e.b].forEach(nd => { if (!edgesByNode.has(nd)) edgesByNode.set(nd, []); edgesByNode.get(nd).push(ix); });
+  });
+
+  /* 道路網から孤立した信号ノード（別ウェイの横断歩道などで接続が切れているもの）を
+     最寄りの道路区間に25m以内でスナップし、その区間を通過したときに信号を計上する */
+  const esig = new Uint8Array(edges.length);
+  const SNAP = 25;
+  for (let i = 0; i < n; i++) {
+    if (!sig[i] || deg[i] > 0) continue;
+    const bx = Math.floor(X[i] / B), by = Math.floor(Y[i] / B);
+    let best = Infinity, bestIx = -1, cand = new Set();
+    for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) {
+      const L_ = H.get((bx + a) * 4096 + (by + b)); if (!L_) continue;
+      for (const nd of L_) { const es = edgesByNode.get(nd); if (es) es.forEach(ix => cand.add(ix)); }
+    }
+    cand.forEach(ix => {
+      const e = edges[ix], d = pointSegDist(X[i], Y[i], X[e.a], Y[e.a], X[e.b], Y[e.b]);
+      if (d < best) { best = d; bestIx = ix; }
+    });
+    if (bestIx >= 0 && best <= SNAP) esig[bestIx] = 1;
+  }
+
+  const head = new Int32Array(n).fill(-1), nxt = [], to = [], w = [], ew = [];
+  const addDir = (a, b, l, es) => { to.push(b); w.push(l); ew.push(es); nxt.push(head[a]); head[a] = to.length - 1; };
+  edges.forEach((e, ix) => { addDir(e.a, e.b, e.l, esig[ix]); addDir(e.b, e.a, e.l, esig[ix]); });
+
+  return { n, X, Y, sig, sl, head, nxt, to, w, ew, H, B, c, kx, ky };
+}
+
+/* 信号距離 = 道のり + λ×通過信号数 のダイクストラ法 */
+function solve(G, lam) {
+  const { n, X, Y, sig, head, nxt, to, w, ew } = G;
+  let s = 0, b = Infinity;
+  for (let i = 0; i < n; i++) { const q = X[i] * X[i] + Y[i] * Y[i]; if (q < b) { b = q; s = i; } }
+  const D = new Float64Array(n).fill(Infinity), P = new Float64Array(n), C = new Int32Array(n), F = new Uint8Array(n);
+  const hk = [], hv = [];
+  const push = (k, v) => { let i = hk.length; hk.push(k); hv.push(v); while (i > 0) { const p = (i - 1) >> 1; if (hk[p] <= k) break; hk[i] = hk[p]; hv[i] = hv[p]; i = p; } hk[i] = k; hv[i] = v; };
+  const pop = () => {
+    const rv = hv[0], k = hk.pop(), v = hv.pop(), m = hk.length;
+    if (m) { let i = 0; for (;;) { let c = 2 * i + 1; if (c >= m) break; if (c + 1 < m && hk[c + 1] < hk[c]) c++; if (hk[c] >= k) break; hk[i] = hk[c]; hv[i] = hv[c]; i = c; } hk[i] = k; hv[i] = v; }
+    return rv;
+  };
+  D[s] = 0; push(0, s);
+  while (hk.length) {
+    const u = pop(); if (F[u]) continue; F[u] = 1;
+    for (let e = head[u]; e >= 0; e = nxt[e]) {
+      const v = to[e]; if (F[v]) continue;
+      const pen = (sig[v] ? lam : 0) + (ew[e] ? lam : 0);
+      const nd = D[u] + w[e] + pen;
+      if (nd < D[v]) { D[v] = nd; P[v] = P[u] + w[e]; C[v] = C[u] + (sig[v] ? 1 : 0) + (ew[e] ? 1 : 0); push(nd, v); }
+    }
+  }
+  return { D, P, C };
+}
+
+/* 格子点への割り当て：各格子点に最も近い（幾何学的に最寄りの）道路点を採用し、
+   同心円状に探索半径を広げながら候補を探すことで塗り残しをなくす */
+function raster(G, R, cs) {
+  const { D, P, C } = R, nx = Math.round(2 * HALF / cs), N = nx * nx;
+  const gD = new Float32Array(N).fill(NaN), gP = new Float32Array(N), gC = new Int16Array(N);
+  const MAXRING = 10;
+  for (let j = 0; j < nx; j++) for (let i = 0; i < nx; i++) {
+    const x = -HALF + (i + .5) * cs, y = HALF - (j + .5) * cs;
+    const bx = Math.floor(x / G.B), by = Math.floor(y / G.B);
+    let best = Infinity, bi = -1, foundRing = -1;
+    for (let ring = 0; ring <= MAXRING; ring++) {
+      for (let a = -ring; a <= ring; a++) for (let b = -ring; b <= ring; b++) {
+        if (Math.max(Math.abs(a), Math.abs(b)) !== ring) continue;
+        const L_ = G.H.get((bx + a) * 4096 + (by + b)); if (!L_) continue;
+        for (const k of L_) {
+          if (D[k] === Infinity) continue;
+          const d = Math.hypot(G.X[k] - x, G.Y[k] - y);
+          if (d < best) { best = d; bi = k; }
+        }
+      }
+      if (bi >= 0) { if (foundRing < 0) foundRing = ring; else if (ring > foundRing) break; }
+    }
+    if (bi >= 0) { const o = j * nx + i; gD[o] = D[bi] + best; gP[o] = P[bi] + best; gC[o] = C[bi]; }
+  }
+  return { nx, cs, gD, gP, gC };
+}
+
+const val = (g, o, m) => isNaN(g.gD[o]) ? NaN : m === 'D' ? g.gD[o] : m === 'C' ? g.gC[o] : g.gD[o] / Math.max(g.gP[o], 100);
+const color = t => {
+  t = Math.min(1, Math.max(0, t)) * (ST.length - 1);
+  const i = Math.min(ST.length - 2, Math.floor(t)), f = t - i;
+  return ST[i].map((v, k) => Math.round(v + (ST[i + 1][k] - v) * f));
+};
+
+/* マーチングスクエア法による等距離線の抽出（field は nx×nx、NaN セルは線を引かない） */
+function marchingSquares(field, nx, level) {
+  const segs = [], v = (i, j) => field[j * nx + i];
+  for (let j = 0; j < nx - 1; j++) for (let i = 0; i < nx - 1; i++) {
+    const a = v(i, j), b = v(i + 1, j), c = v(i + 1, j + 1), d = v(i, j + 1);
+    if (isNaN(a) || isNaN(b) || isNaN(c) || isNaN(d)) continue;
+    let idx = 0; if (a >= level) idx |= 1; if (b >= level) idx |= 2; if (c >= level) idx |= 4; if (d >= level) idx |= 8;
+    if (idx === 0 || idx === 15) continue;
+    const lerp = (v1, v2) => Math.max(0, Math.min(1, (level - v1) / ((v2 - v1) || 1e-9)));
+    const T = [i + lerp(a, b), j], Bm = [i + lerp(d, c), j + 1], Lm = [i, j + lerp(a, d)], Rm = [i + 1, j + lerp(b, c)];
+    const table = { 1: [[Lm, Bm]], 2: [[Bm, Rm]], 3: [[Lm, Rm]], 4: [[Rm, T]], 5: [[Lm, T], [Rm, Bm]], 6: [[Bm, T]], 7: [[Lm, T]], 8: [[T, Lm]], 9: [[T, Bm]], 10: [[T, Rm], [Bm, Lm]], 11: [[T, Rm]], 12: [[Rm, Lm]], 13: [[Bm, Rm]], 14: [[Bm, Lm]] };
+    (table[idx] || []).forEach(([p1, p2]) => segs.push([p1[0], p1[1], p2[0], p2[1]]));
+  }
+  return segs;
+}
+
+function paint() {
+  if (!G) return;
+  const lam = +$('lam').value, mode = $('mode').value, cs = +$('cs').value;
+  if (img) { map.removeLayer(img); img = null; }
+  grid = raster(G, solve(G, lam), cs);
+  const { nx } = grid, N = nx * nx;
+
+  const vs = []; for (let o = 0; o < N; o++) { const v = val(grid, o, mode); if (!isNaN(v)) vs.push(v); }
+  vs.sort((a, b) => a - b);
+  const lo = mode === 'R' ? 1 : 0;
+  let hi = vs[Math.floor(vs.length * .98)] || 1; if (hi <= lo) hi = lo + 1;
+
+  const ps = []; for (let o = 0; o < N; o++) if (!isNaN(grid.gD[o])) ps.push(grid.gP[o]);
+  ps.sort((a, b) => a - b);
+  let pHi = ps[Math.floor(ps.length * .98)] || 1; if (pHi <= 0) pHi = 1;
+
+  const SCALE = Math.max(1, Math.min(6, Math.round(560 / nx)));
+  const big = nx * SCALE;
+  const small = document.createElement('canvas'); small.width = small.height = nx;
+  const scx = small.getContext('2d'); const im = scx.createImageData(nx, nx);
+  for (let o = 0; o < N; o++) {
+    const v = val(grid, o, mode); if (isNaN(v)) continue;
+    const [r, g, b] = color((v - lo) / (hi - lo));
+    im.data.set([r, g, b, 255], o * 4);
+  }
+  scx.putImageData(im, 0, 0);
+
+  const cv = document.createElement('canvas'); cv.width = cv.height = big;
+  const cx = cv.getContext('2d');
+  cx.imageSmoothingEnabled = false;
+  cx.drawImage(small, 0, 0, big, big);
+
+  const mp = new Float32Array(N);
+  for (let o = 0; o < N; o++) mp[o] = isNaN(grid.gD[o]) ? NaN : grid.gP[o];
+  const CI = 250;
+  cx.lineWidth = Math.max(1.3, SCALE * 0.75); cx.lineJoin = 'round'; cx.lineCap = 'round';
+  for (let lev = CI; lev < pHi + CI; lev += CI) {
+    const segs = marchingSquares(mp, nx, lev); if (!segs.length) continue;
+    const [r, g, b] = color(Math.min(1, lev / pHi));
+    cx.strokeStyle = `rgba(${r},${g},${b},0.95)`;
+    cx.beginPath();
+    segs.forEach(([x1, y1, x2, y2]) => { cx.moveTo(x1 * SCALE, y1 * SCALE); cx.lineTo(x2 * SCALE, y2 * SCALE); });
+    cx.stroke();
+  }
+
+  const c = G.c, bnds = [[c.lat - HALF / G.ky, c.lng - HALF / G.kx], [c.lat + HALF / G.ky, c.lng + HALF / G.kx]];
+  img = L.imageOverlay(cv.toDataURL(), bnds, { pane: 'heat', opacity: .68, interactive: false }).addTo(map);
+
+  const fmt = { D: v => Math.round(v) + ' m', C: v => Math.round(v) + ' 回', R: v => '×' + v.toFixed(2) };
+  $('lt').textContent = { D: '信号距離（ピンから）', C: '通過する信号数', R: '信号による伸び率' }[mode];
+  $('lo').textContent = fmt[mode](lo); $('hi').textContent = fmt[mode](hi) + '以上';
+  $('legend').style.display = 'block';
+  const ns = G.sl.filter(s => Math.abs((s.lon - c.lng) * G.kx) < HALF && Math.abs((s.lat - c.lat) * G.ky) < HALF).length;
+  const filled = Math.round(100 * vs.length / N);
+  st(`完了：範囲内の信号機 ${ns} 件、道路ノード ${G.n.toLocaleString()} 点、着色率 ${filled}%`);
+}
+
+['lam', 'mode', 'cs'].forEach(id => $(id).addEventListener('input', () => { $('lamv').textContent = $('lam').value + ' m'; paint(); }));
+
+map.on('mousemove', e => {
+  if (!grid || !G) return;
+  const x = (e.latlng.lng - G.c.lng) * G.kx, y = (e.latlng.lat - G.c.lat) * G.ky;
+  const i = Math.floor((x + HALF) / grid.cs), j = Math.floor((HALF - y) / grid.cs);
+  if (i < 0 || j < 0 || i >= grid.nx || j >= grid.nx) return;
+  const o = j * grid.nx + i;
+  $('ro').textContent = isNaN(grid.gD[o]) ? '—' : `信号距離 ${Math.round(grid.gD[o])} m ／ 道のり ${Math.round(grid.gP[o])} m ／ 信号 ${grid.gC[o]} 回`;
+});
+</script>
+</body>
+</html>
